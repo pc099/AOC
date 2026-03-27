@@ -1,0 +1,4 @@
+.env
+mail_jira_bot/.env
+__pycache__/
+*.pyc
