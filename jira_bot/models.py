@@ -19,4 +19,37 @@ class JiraTicket:
     status: str
     priority: str
     issue_type: str
+    description: str
     url: str
+
+
+@dataclass(slots=True)
+class TicketExplanation:
+    ticket_key: str
+    explanation: str
+    comment_posted: bool
+
+
+@dataclass(slots=True)
+class JiraIssueReference:
+    key: str
+    url: str
+
+
+@dataclass(slots=True)
+class JiraComment:
+    comment_id: str
+    body: str
+    author_name: str
+    created_at: str
+
+
+@dataclass(slots=True)
+class ImplementationResult:
+    source_ticket_key: str
+    approval_detected: bool
+    story_created: bool
+    story_key: str | None
+    story_url: str | None
+    artifact_path: str | None
+    status: str
