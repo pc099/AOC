@@ -216,6 +216,131 @@ class AsahioTicketExplainer:
             ],
         )
 
+    def plan_execution_tasks(
+        self,
+        ticket: dict[str, object],
+        request_comment: str,
+        existing_comments: list[str],
+    ) -> list[dict[str, str]]:
+        description = str(ticket.get("description") or "").strip()
+        acceptance_criteria = _extract_acceptance_criteria(description)
+        state_fingerprint = _build_state_fingerprint(ticket=ticket, extra=existing_comments + [request_comment])
+        prompt = (
+            "You are planning concrete follow-up work from a Jira comment that asks for action, such as creating tickets or building code. "
+            "Return valid JSON only with the shape {\"tasks\": [{...}]}.\n\n"
+            "Each task object must have these keys:\n"
+            "summary, description, artifact_file_name, artifact_content.\n\n"
+            "Rules:\n"
+            "1. Create one task per distinct workstream requested by the user comment.\n"
+            "2. Make the summary Jira-story ready and concise.\n"
+            "3. Make the description actionable and grounded in the source ticket.\n"
+            "4. artifact_file_name should be a safe lowercase file name ending in .md or .py.\n"
+            "5. artifact_content should contain a first-pass deliverable for that task.\n"
+            "6. If the user explicitly asks for code, include a starter implementation artifact where appropriate.\n"
+            "7. Do not invent completed results beyond what can be drafted from the ticket and comments.\n\n"
+            "Source ticket:\n"
+            f"{json.dumps(ticket, indent=2)}\n\n"
+            "Acceptance criteria:\n"
+            f"{json.dumps(acceptance_criteria, indent=2)}\n\n"
+            "User action request comment:\n"
+            f"{request_comment}\n\n"
+            "Existing comments:\n"
+            f"{json.dumps(existing_comments, indent=2)}\n\n"
+            "Execution state fingerprint:\n"
+            f"{state_fingerprint}"
+        )
+        content = self._fresh_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You convert actionable Jira comments into concrete execution tasks and starter artifacts. "
+                        "Return JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+        )
+        tasks = _parse_execution_tasks(content)
+        if tasks:
+            return tasks
+
+        summary = str(ticket.get("summary") or "Untitled task")
+        return [
+            {
+                "summary": f"Execution follow-up: {summary}",
+                "description": (
+                    f"Create the requested follow-up work for {ticket.get('key', '')}.\n\n"
+                    f"User request: {request_comment}"
+                ),
+                "artifact_file_name": "execution_follow_up.md",
+                "artifact_content": (
+                    f"# Execution Follow-up for {ticket.get('key', '')}\n\n"
+                    f"User request:\n{request_comment}\n"
+                ),
+            }
+        ]
+
+    def plan_ticket_work(
+        self,
+        ticket: dict[str, object],
+        existing_comments: list[str],
+    ) -> dict[str, object]:
+        description = str(ticket.get("description") or "").strip()
+        acceptance_criteria = _extract_acceptance_criteria(description)
+        state_fingerprint = _build_state_fingerprint(ticket=ticket, extra=existing_comments)
+        prompt = (
+            "You are a digital employee assigned to a Jira ticket. Your job is to do the next layer of actual work for the ticket, "
+            "not just describe what should be done. Return valid JSON only with this shape: "
+            "{\"update_comment\": string, \"artifacts\": [{\"file_name\": string, \"content\": string}]}.\n\n"
+            "Rules:\n"
+            "1. Do non-implementation work that moves the ticket forward right now.\n"
+            "2. Prefer analysis, design, decision records, specs, schemas, estimates, and comparison documents.\n"
+            "3. Do not produce implementation code unless the ticket comments already contain explicit approval to proceed with implementation.\n"
+            "4. update_comment must describe what work was completed, what artifacts were produced, and what review or approval is needed next.\n"
+            "5. Each artifact must be a concrete first-pass deliverable derived from the ticket.\n"
+            "6. file_name must be safe and end in .md, .json, .yaml, .csv, or .txt for this work phase.\n\n"
+            "Source ticket:\n"
+            f"{json.dumps(ticket, indent=2)}\n\n"
+            "Acceptance criteria:\n"
+            f"{json.dumps(acceptance_criteria, indent=2)}\n\n"
+            "Existing comments:\n"
+            f"{json.dumps(existing_comments, indent=2)}\n\n"
+            "Work state fingerprint:\n"
+            f"{state_fingerprint}"
+        )
+        content = self._fresh_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You act like a responsible employee completing ticket work. "
+                        "Produce concrete non-code deliverables first, then summarize what you did for review. "
+                        "Return JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+        )
+        package = _parse_ticket_work_package(content)
+        if package is not None:
+            return package
+
+        summary = str(ticket.get("summary") or "Untitled task")
+        key = str(ticket.get("key") or "ticket")
+        return {
+            "update_comment": (
+                f"Completed first-pass ticket work for {key}. I prepared a working document that captures the current scope and next decisions needed. "
+                "Please review it and confirm whether I should proceed to implementation."
+            ),
+            "artifacts": [
+                {
+                    "file_name": f"{key.lower()}_work_note.md",
+                    "content": f"# {summary}\n\nSource ticket: {key}\n\nThis is the first-pass working note for the assigned ticket.\n",
+                }
+            ],
+        }
+
     def _fresh_completion(self, messages: list[dict[str, str]]) -> str:
         response = self._client.chat.completions.create(
             messages=messages,
@@ -315,6 +440,58 @@ def _parse_implementation_package(
             "Engineering note: translate the approved acceptance criteria into concrete repository changes before coding."
         ),
     }
+
+
+def _parse_execution_tasks(content: str) -> list[dict[str, str]]:
+    try:
+        match = re.search(r"\{.*\}|\[.*\]", content, re.DOTALL)
+        payload = json.loads(match.group(0) if match else content)
+        tasks = payload.get("tasks", payload) if isinstance(payload, dict) else payload
+        parsed_tasks: list[dict[str, str]] = []
+        if isinstance(tasks, list):
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                summary = str(task.get("summary") or "").strip()
+                description = str(task.get("description") or "").strip()
+                artifact_file_name = str(task.get("artifact_file_name") or "").strip()
+                artifact_content = str(task.get("artifact_content") or "").strip()
+                if summary and description and artifact_file_name and artifact_content:
+                    parsed_tasks.append(
+                        {
+                            "summary": summary,
+                            "description": description,
+                            "artifact_file_name": artifact_file_name,
+                            "artifact_content": artifact_content,
+                        }
+                    )
+        if parsed_tasks:
+            return parsed_tasks
+    except Exception:
+        pass
+    return []
+
+
+def _parse_ticket_work_package(content: str) -> dict[str, object] | None:
+    try:
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        payload = json.loads(match.group(0) if match else content)
+        update_comment = str(payload.get("update_comment") or "").strip()
+        artifacts_payload = payload.get("artifacts") or []
+        artifacts: list[dict[str, str]] = []
+        if isinstance(artifacts_payload, list):
+            for artifact in artifacts_payload:
+                if not isinstance(artifact, dict):
+                    continue
+                file_name = str(artifact.get("file_name") or "").strip()
+                artifact_content = str(artifact.get("content") or "").strip()
+                if file_name and artifact_content:
+                    artifacts.append({"file_name": file_name, "content": artifact_content})
+        if update_comment and artifacts:
+            return {"update_comment": update_comment, "artifacts": artifacts}
+    except Exception:
+        pass
+    return None
 
 
 def _build_state_fingerprint(ticket: dict[str, object], extra: list[str]) -> str:

@@ -9,7 +9,7 @@ from pathlib import Path
 from agent.asahio_agent import AsahioTicketExplainer
 from .config import Settings
 from .jira_client import JiraClient
-from .models import ImplementationResult, JiraComment, TicketExplanation
+from .models import ExecutionRequestResult, ImplementationResult, JiraComment, TicketExplanation
 
 
 APPROVAL_PATTERN = re.compile(
@@ -18,9 +18,16 @@ APPROVAL_PATTERN = re.compile(
 )
 IMPLEMENTATION_STORY_PATTERN = re.compile(r"Implementation story created:\s*([A-Z][A-Z0-9_]+-\d+)")
 IMPLEMENTATION_DIR = Path(__file__).resolve().parent.parent / "generated_implementation"
+WORK_DIR = Path(__file__).resolve().parent.parent / "generated_work"
 AGENT_ANALYSIS_MARKER = "[jira-bot-analysis]"
 AGENT_REVIEW_MARKER = "[jira-bot-review]"
 AGENT_IMPLEMENTATION_MARKER = "[jira-bot-implementation]"
+AGENT_TASK_MARKER = "[jira-bot-task]"
+AGENT_WORK_MARKER = "[jira-bot-work]"
+EXECUTION_REQUEST_PATTERN = re.compile(
+    r"create (?:a |new )?(?:ticket|story|task)|build .*code|write .*code|implement .*code|cdktf|starter template|generate .*code",
+    re.IGNORECASE,
+)
 
 
 class MailJiraBot:
@@ -160,9 +167,14 @@ class MailJiraBot:
             comments = self._jira_client.get_ticket_comments(ticket["key"])
             latest_agent_comment = _find_latest_agent_feedback(comments)
             approval_comment = _find_approval_comment(comments)
+            execution_request = _find_latest_execution_request(comments, latest_agent_comment)
 
             if approval_comment is not None:
                 results.append(self._process_single_ticket_implementation(ticket, comments, explainer, dry_run=dry_run))
+                continue
+
+            if execution_request is not None:
+                results.append(self._process_execution_request(ticket, comments, execution_request, explainer, dry_run=dry_run))
                 continue
 
             if latest_agent_comment is None:
@@ -259,6 +271,65 @@ class MailJiraBot:
             lines.append("No assigned tickets found.")
 
         return "\n".join(lines).rstrip()
+
+    def _process_execution_request(
+        self,
+        ticket: dict[str, object],
+        comments: list[JiraComment],
+        execution_request: JiraComment,
+        explainer: AsahioTicketExplainer,
+        dry_run: bool,
+    ) -> dict[str, object]:
+        tasks = explainer.plan_execution_tasks(
+            ticket=ticket,
+            request_comment=execution_request.body,
+            existing_comments=[comment.body for comment in comments],
+        )
+        if not tasks:
+            return asdict(
+                ExecutionRequestResult(
+                    source_ticket_key=ticket["key"],
+                    source_comment_id=execution_request.comment_id,
+                    status="execution-no-tasks",
+                    created_ticket_keys=[],
+                    artifact_paths=[],
+                )
+            )
+
+        created_ticket_keys: list[str] = []
+        artifact_paths: list[str] = []
+
+        if not dry_run:
+            for task in tasks:
+                story = self._jira_client.create_story(
+                    source_issue_key=ticket["key"],
+                    summary=task["summary"],
+                    description=task["description"],
+                )
+                created_ticket_keys.append(story.key)
+                artifact_paths.append(str(self._write_named_artifact(story.key, task["artifact_file_name"], task["artifact_content"])))
+
+            self._jira_client.add_comment(
+                ticket["key"],
+                _format_agent_comment(
+                    marker=AGENT_TASK_MARKER,
+                    body=(
+                        "Execution tasks created:\n"
+                        + "\n".join(f"- {ticket_key}" for ticket_key in created_ticket_keys)
+                    ),
+                    source_comment_id=execution_request.comment_id,
+                ),
+            )
+
+        return asdict(
+            ExecutionRequestResult(
+                source_ticket_key=ticket["key"],
+                source_comment_id=execution_request.comment_id,
+                status="execution-planned" if dry_run else "execution-created",
+                created_ticket_keys=created_ticket_keys,
+                artifact_paths=artifact_paths,
+            )
+        )
 
     def _process_single_ticket_implementation(
         self,
@@ -393,8 +464,124 @@ class MailJiraBot:
         )
         return artifact_path
 
+    def _write_named_artifact(self, story_key: str, file_name: str, content: str) -> Path:
+        IMPLEMENTATION_DIR.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", file_name).strip("._") or "artifact.md"
+        artifact_path = IMPLEMENTATION_DIR / f"{story_key}_{safe_name}"
+        artifact_path.write_text(content, encoding="utf-8")
+        return artifact_path
+
+    def _write_work_artifact(self, ticket_key: str, file_name: str, content: str) -> Path:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", file_name).strip("._") or "artifact.md"
+        artifact_path = WORK_DIR / f"{ticket_key}_{safe_name}"
+        artifact_path.write_text(content, encoding="utf-8")
+        return artifact_path
+
+    def _deliver_ticket_work(
+        self,
+        ticket: dict[str, object],
+        comments: list[JiraComment],
+        explainer: AsahioTicketExplainer,
+        dry_run: bool,
+    ) -> dict[str, object]:
+        package = explainer.plan_ticket_work(ticket=ticket, existing_comments=[comment.body for comment in comments])
+        artifact_paths: list[str] = []
+        if not dry_run:
+            for artifact in package["artifacts"]:
+                artifact_paths.append(str(self._write_work_artifact(ticket["key"], artifact["file_name"], artifact["content"])))
+
+            comment_body = package["update_comment"].strip()
+            if artifact_paths:
+                comment_body = "\n\n".join(
+                    [
+                        comment_body,
+                        "Artifacts created:",
+                        "\n".join(f"- {path}" for path in artifact_paths),
+                    ]
+                )
+
+            self._jira_client.add_comment(
+                ticket["key"],
+                _format_agent_comment(marker=AGENT_WORK_MARKER, body=comment_body),
+            )
+
+        return {
+            "source_ticket_key": ticket["key"],
+            "status": "work-planned" if dry_run else "work-delivered",
+            "story_key": None,
+            "story_url": None,
+            "artifact_path": None,
+            "artifact_paths": artifact_paths,
+        }
+
+    def run_employee_ticket_cycle(self, ticket_key: str, dry_run: bool = False) -> dict[str, object]:
+        snapshot = self.collect(ticket_limit=1, ticket_key=ticket_key)
+        explainer = AsahioTicketExplainer(self._settings)
+        results: list[dict[str, object]] = []
+
+        for ticket in snapshot["tickets"]:
+            comments = self._jira_client.get_ticket_comments(ticket["key"])
+            latest_work_comment = _find_latest_work_comment(comments)
+            approval_comment = _find_approval_comment(comments)
+
+            if approval_comment is not None and latest_work_comment is not None:
+                results.append(self._process_single_ticket_implementation(ticket, comments, explainer, dry_run=dry_run))
+                continue
+
+            if latest_work_comment is None:
+                results.append(self._deliver_ticket_work(ticket, comments, explainer, dry_run=dry_run))
+                continue
+
+            review_comment = _find_latest_unaddressed_review(comments, latest_work_comment)
+            if review_comment is not None:
+                revised_comment = explainer.revise_ticket_comment(
+                    ticket=ticket,
+                    snapshot=snapshot,
+                    current_comment=_strip_agent_metadata(latest_work_comment.body),
+                    review_comment=review_comment.body,
+                    existing_comments=[comment.body for comment in comments],
+                )
+                if revised_comment and not dry_run:
+                    self._jira_client.add_comment(
+                        ticket["key"],
+                        _format_agent_comment(
+                            marker=AGENT_WORK_MARKER,
+                            body=revised_comment,
+                            source_comment_id=review_comment.comment_id,
+                        ),
+                    )
+                results.append(
+                    {
+                        "source_ticket_key": ticket["key"],
+                        "status": "work-updated" if revised_comment else "review-detected",
+                        "story_key": None,
+                        "story_url": None,
+                        "artifact_path": None,
+                        "artifact_paths": [],
+                    }
+                )
+                continue
+
+            results.append(
+                {
+                    "source_ticket_key": ticket["key"],
+                    "status": "waiting-for-approval",
+                    "story_key": None,
+                    "story_url": None,
+                    "artifact_path": None,
+                    "artifact_paths": [],
+                }
+            )
+
+        return {
+            "agent": {"id": explainer.agent_id, "name": explainer.agent_name},
+            "results": results,
+            "dry_run": dry_run,
+        }
+
     def run_autonomous_ticket(self, ticket_key: str, dry_run: bool = False) -> str:
-        payload = self.run_ticket_feedback_loop(ticket_limit=1, dry_run=dry_run, ticket_key=ticket_key)
+        payload = self.run_employee_ticket_cycle(ticket_key=ticket_key, dry_run=dry_run)
         result = payload["results"][0] if payload["results"] else {
             "source_ticket_key": ticket_key,
             "status": "not-found",
@@ -408,6 +595,10 @@ class MailJiraBot:
             lines.append(f"Story: {result['story_key']} | {result['story_url']}")
         if result.get("artifact_path"):
             lines.append(f"Implementation brief: {result['artifact_path']}")
+        if result.get("artifact_paths"):
+            lines.append("Work artifacts:")
+            for artifact_path in result["artifact_paths"]:
+                lines.append(f"- {artifact_path}")
         return "\n".join(lines)
 
     def run_autonomous_worker(
@@ -459,6 +650,13 @@ def _find_latest_agent_feedback(comments: list[JiraComment]) -> JiraComment | No
     return None
 
 
+def _find_latest_work_comment(comments: list[JiraComment]) -> JiraComment | None:
+    for comment in reversed(comments):
+        if comment.body.startswith(AGENT_WORK_MARKER) or comment.body.startswith(AGENT_REVIEW_MARKER):
+            return comment
+    return None
+
+
 def _find_latest_unaddressed_review(
     comments: list[JiraComment],
     latest_agent_comment: JiraComment,
@@ -477,8 +675,31 @@ def _find_latest_unaddressed_review(
     return None
 
 
+def _find_latest_execution_request(
+    comments: list[JiraComment],
+    latest_agent_comment: JiraComment | None,
+) -> JiraComment | None:
+    stop_comment_id = latest_agent_comment.comment_id if latest_agent_comment else None
+    for comment in reversed(comments):
+        if stop_comment_id and comment.comment_id == stop_comment_id:
+            break
+        if _is_agent_managed_comment(comment):
+            continue
+        if _is_comment_addressed(comments, comment.comment_id):
+            continue
+        if EXECUTION_REQUEST_PATTERN.search(comment.body):
+            return comment
+    return None
+
+
 def _is_agent_managed_comment(comment: JiraComment) -> bool:
-    return comment.body.startswith(AGENT_ANALYSIS_MARKER) or comment.body.startswith(AGENT_REVIEW_MARKER) or comment.body.startswith(AGENT_IMPLEMENTATION_MARKER)
+    return (
+        comment.body.startswith(AGENT_ANALYSIS_MARKER)
+        or comment.body.startswith(AGENT_REVIEW_MARKER)
+        or comment.body.startswith(AGENT_IMPLEMENTATION_MARKER)
+        or comment.body.startswith(AGENT_TASK_MARKER)
+        or comment.body.startswith(AGENT_WORK_MARKER)
+    )
 
 
 def _is_comment_addressed(comments: list[JiraComment], source_comment_id: str) -> bool:

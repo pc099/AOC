@@ -53,3 +53,20 @@ class ImplementationResult:
     story_url: str | None
     artifact_path: str | None
     status: str
+
+
+@dataclass(slots=True)
+class ExecutionTaskPlan:
+    summary: str
+    description: str
+    artifact_file_name: str
+    artifact_content: str
+
+
+@dataclass(slots=True)
+class ExecutionRequestResult:
+    source_ticket_key: str
+    source_comment_id: str | None
+    status: str
+    created_ticket_keys: list[str]
+    artifact_paths: list[str]
